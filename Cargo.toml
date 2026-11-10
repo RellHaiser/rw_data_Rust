@@ -1,0 +1,20 @@
+[package]
+name = "rw_data"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust port of rw_data.dll, the .dta virtual file system of Hidden & Dangerous 2"
+publish = false
+
+[lib]
+name = "rw_data"
+# cdylib: the drop-in rw_data.dll / librw_data.so; rlib: the tests and Rust users.
+crate-type = ["cdylib", "rlib"]
+
+# No dependencies: everything is built on the standard library.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
