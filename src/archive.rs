@@ -194,6 +194,7 @@ unsafe fn construct(st: &mut State, this: *mut DtaRead, file_name: &[u8]) -> boo
     st.search_order.push(SearchSlot {
         archive: this,
         table: st.archive_tables.len() as i32 - 1,
+        prefer: false,
     });
     add_ref_locked(a);
     a.key_mask = !a.key_mask;
@@ -234,6 +235,17 @@ fn destroy(st: &mut State, this: *mut DtaRead) {
         }
     }
     LEAK_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+
+    // (port) The mod archives live as long as the host keeps an archive of its own: once
+    // the last one is gone they are released too (and mounted again by the next dtaCreate).
+    if st.mods_mounted
+        && !st
+            .search_order
+            .iter()
+            .any(|s| !st.mods.contains(&s.archive))
+    {
+        crate::mods::unmount(st);
+    }
 }
 
 /// MSVC's scalar deleting destructor, kept for the layout of the virtual table.
@@ -258,17 +270,23 @@ unsafe fn add_ref(this: *mut DtaRead) -> i32 {
 /// The count is unsigned: releasing an archive that was never referenced (a failed
 /// dtaCreate) wraps it around and leaks the object, as in the original.
 unsafe fn release(this: *mut DtaRead) -> i32 {
-    with_state(|st| {
-        LEAK_REFERENCES.fetch_sub(1, Ordering::Relaxed);
-        let a = &mut *this;
-        a.ref_count = a.ref_count.wrapping_sub(1);
-        let remaining = a.ref_count as i32;
-        if a.ref_count < 1 {
-            destroy(st, this);
-            drop(Box::from_raw(this));
-        }
-        remaining
-    })
+    with_state(|st| release_locked(st, this))
+}
+
+/// Release under the lock.
+///
+/// # Safety
+/// `this` must be a live archive object.
+pub unsafe fn release_locked(st: &mut State, this: *mut DtaRead) -> i32 {
+    LEAK_REFERENCES.fetch_sub(1, Ordering::Relaxed);
+    let a = &mut *this;
+    a.ref_count = a.ref_count.wrapping_sub(1);
+    let remaining = a.ref_count as i32;
+    if a.ref_count < 1 {
+        destroy(st, this);
+        drop(Box::from_raw(this));
+    }
+    remaining
 }
 
 /// The game applies its key in two steps: XorKey(key ^ r) with a random r, then
@@ -299,7 +317,7 @@ unsafe fn set_key(this: *mut DtaRead, low: u32, high: u32) -> bool {
 }
 
 /// Reads and decrypts the file table (the common part of XorKey and SetKey).
-fn load_file_table(st: &mut State, a: &mut DtaRead, this: *mut DtaRead, key: u64) -> bool {
+pub fn load_file_table(st: &mut State, a: &mut DtaRead, this: *mut DtaRead, key: u64) -> bool {
     let Some(file) = a.file.clone() else {
         return false;
     };
@@ -343,9 +361,7 @@ fn load_file_table(st: &mut State, a: &mut DtaRead, this: *mut DtaRead, key: u64
         decrypt(&mut header[4..], key);
         let header_checksum = le32(&header, 0x14);
         header[0x14..0x18].fill(0);
-        if st.error_callback.is_some()
-            && header_checksum != checksum16(&header, CHECKSUM_SEED) as u32
-        {
+        if st.reporting() && header_checksum != checksum16(&header, CHECKSUM_SEED) as u32 {
             st.report(this, &name, DTA_ERROR_CHECKSUM);
         }
         table_offset = le32(&header, 8);
@@ -396,9 +412,7 @@ fn load_file_table(st: &mut State, a: &mut DtaRead, this: *mut DtaRead, key: u64
     if read != size {
         st.report(this, &name, DTA_ERROR_SIZE);
     }
-    if a.version != 0
-        && st.error_callback.is_some()
-        && table_checksum != checksum16(&raw, CHECKSUM_SEED) as u32
+    if a.version != 0 && st.reporting() && table_checksum != checksum16(&raw, CHECKSUM_SEED) as u32
     {
         st.report(this, &name, DTA_ERROR_CHECKSUM);
     }
@@ -446,26 +460,38 @@ unsafe fn get_name(this: *mut DtaRead) -> *const c_char {
 
 /// dtaCreate: mounts an archive and appends it to the search order; null when the file is
 /// missing or is not an archive.
+///
+/// (port) The host's first archive also mounts the archives of the Mods folder, ahead of it
+/// in the search order (see mods.rs).
 pub fn create(file_name: &[u8]) -> *mut DtaRead {
-    let (archive, ok) = with_state(|st| {
-        let archive = Box::into_raw(Box::new(DtaRead {
-            vtable: &VTABLE,
-            key_mask: 0,
-            key: 0,
-            ref_count: 0,
-            id: 0,
-            file: None,
-            version: -1,
-            file_name: CString::default(),
-        }));
-        // SAFETY: `archive` was just allocated.
-        let ok = unsafe { construct(st, archive, file_name) };
-        (archive, ok)
-    });
-    if !ok {
-        // SAFETY: the object is alive (it leaks, see release).
-        unsafe { release(archive) };
-        return ptr::null_mut();
+    with_state(|st| {
+        let archive = create_locked(st, file_name);
+        if !archive.is_null() && !st.mods_mounted {
+            let host_slot = st.search_order.len() - 1;
+            crate::mods::mount(st);
+            st.search_order[host_slot..].rotate_left(1);
+        }
+        archive
+    })
+}
+
+/// dtaCreate under the lock (without the mods).
+pub fn create_locked(st: &mut State, file_name: &[u8]) -> *mut DtaRead {
+    let archive = Box::into_raw(Box::new(DtaRead {
+        vtable: &VTABLE,
+        key_mask: 0,
+        key: 0,
+        ref_count: 0,
+        id: 0,
+        file: None,
+        version: -1,
+        file_name: CString::default(),
+    }));
+    // SAFETY: `archive` was just allocated.
+    if unsafe { construct(st, archive, file_name) } {
+        return archive;
     }
-    archive
+    // SAFETY: the object is alive (it leaks, see release).
+    unsafe { release_locked(st, archive) };
+    ptr::null_mut()
 }

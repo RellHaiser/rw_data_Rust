@@ -505,3 +505,182 @@ fn writing_logs_and_disk_files() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Packs the given files into `archive`; `key` is "blank" or "low:high". None without Python.
+fn pack_files(dir: &Path, archive: &Path, key: &str, files: &[(&str, &[u8])]) -> Option<()> {
+    let python = python()?;
+    let stem = archive.file_stem().unwrap().to_str().unwrap();
+    let folder = dir.join(format!("src_{stem}"));
+    for (file, contents) in files {
+        let path = folder.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let packer = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tools")
+        .join("dta_pack.py");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(packer)
+        .arg(&folder)
+        .arg(archive)
+        .args(["--key", key, "--workers", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dta_pack.py failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(())
+}
+
+/// Opens `name` and reads it whole (at most 64 bytes); None when it cannot be opened.
+fn read_text(name: &str, archives_first: bool) -> Option<Vec<u8>> {
+    let h = unsafe { dtaOpen(c(name).as_ptr(), archives_first) };
+    if h < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    let n = unsafe { dtaRead(h, buf.as_mut_ptr().cast(), 64) };
+    dtaClose(h);
+    Some(buf[..n.max(0) as usize].to_vec())
+}
+
+#[test]
+fn mod_archives() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("mods");
+    let mods = dir.join("Mods");
+    let key = format!("{LOW:#x}:{HIGH:#x}");
+    // A loose file in the working directory (where dtaOpen looks on disk).
+    let loose = "rw_data_test_mods_loose.txt";
+    let loose_dir = format!("rw_data_test_mods_{}", std::process::id());
+    // (archive names use '\', which Windows also takes on disk)
+    let loose_path = format!("{loose_dir}\\{loose}");
+
+    let game: &[(&str, &[u8])] = &[
+        ("readme.txt", b"game"),
+        ("game_only.txt", b"game only"),
+        (&loose_path, b"game"),
+    ];
+    if pack_files(&dir, &dir.join("Game.dta"), &key, game).is_none() {
+        eprintln!("skipped: Python is needed to pack the test archives");
+        return;
+    }
+    let both = [("readme.txt", b"mod a" as &[u8]), ("a.txt", b"a")];
+    pack_files(&dir, &mods.join("a_mod.dta"), "blank", &both).unwrap();
+    let b = [
+        ("readme.txt", b"mod b" as &[u8]),
+        ("b.txt", b"b"),
+        (loose_path.as_str(), b"mod b"),
+    ];
+    pack_files(&dir, &mods.join("B_Mod.DTA"), "blank", &b).unwrap();
+    pack_files(&dir, &mods.join("Keyed.dta"), &key, &[("keyed.txt", b"k")]).unwrap();
+    pack_files(&dir, &mods.join("Off.dta"), "blank", &[("off.txt", b"off")]).unwrap();
+    std::fs::write(mods.join("NotAnArchive.dta"), b"nope").unwrap();
+    std::fs::create_dir_all(&loose_dir).unwrap();
+    std::fs::write(Path::new(&loose_dir).join(loose), b"disk").unwrap();
+
+    std::env::set_var("RW_DATA_MODS_DIR", &mods);
+    ERRORS.store(0, Ordering::SeqCst);
+    let previous = dtaSetCallbackERR(Some(count_errors));
+    dtaDumpMemoryLeaks(true);
+
+    // 1. No load order: alphabetical, the first mod wins; loose files win over archives.
+    assert_eq!(dtaModsMounted(), 0);
+    let game_archive = mount(&dir.join("Game.dta"));
+    unsafe { (vt(game_archive).set_key)(game_archive, LOW, HIGH) };
+    assert_eq!(
+        dtaModsMounted(),
+        3,
+        "a_mod, B_Mod, Off (Keyed and NotAnArchive fail)"
+    );
+    // The mods were mounted ahead of the game's archive.
+    assert_eq!(unsafe { (vt(game_archive).get_priority)(game_archive) }, 3);
+    assert_eq!(read_text("readme.txt", false).unwrap(), b"mod a");
+    assert_eq!(read_text("game_only.txt", false).unwrap(), b"game only");
+    assert_eq!(read_text("b.txt", false).unwrap(), b"b");
+    assert_eq!(read_text("off.txt", false).unwrap(), b"off");
+    assert!(read_text("keyed.txt", false).is_none());
+    assert_eq!(read_text(&loose_path, false).unwrap(), b"disk");
+    assert_eq!(read_text(&loose_path, true).unwrap(), b"mod b");
+    // The rejected mods did not reach the host's callback.
+    assert_eq!(ERRORS.load(Ordering::SeqCst), 0);
+    let log = std::fs::read_to_string(mods.join("mods.log")).unwrap();
+    assert!(
+        log.contains("Mod archive 1: ") && log.contains("a_mod.dta"),
+        "{log}"
+    );
+    assert!(log.contains("Keyed.dta' could not be read"), "{log}");
+    assert!(
+        log.contains("NotAnArchive.dta' is not a .dta archive"),
+        "{log}"
+    );
+
+    // 2. Releasing the host's last archive releases the mods.
+    release(game_archive);
+    assert_eq!(dtaModsMounted(), 0);
+    assert!(read_text("a.txt", true).is_none());
+
+    // 3. A load order: B first and preferred over loose files, Off disabled, a missing name,
+    //    prefer_archives off. The next dtaCreate mounts the mods again.
+    std::fs::write(
+        mods.join("load_order.txt"),
+        "# test\r\nprefer_archives = no\r\n+b_mod   # comment\r\n-off\r\nMissing.dta\r\n",
+    )
+    .unwrap();
+    let game_archive = mount(&dir.join("Game.dta"));
+    unsafe { (vt(game_archive).set_key)(game_archive, LOW, HIGH) };
+    assert_eq!(dtaModsMounted(), 2);
+    assert_eq!(read_text("readme.txt", false).unwrap(), b"mod b");
+    assert_eq!(read_text("a.txt", false).unwrap(), b"a");
+    assert!(read_text("off.txt", false).is_none());
+    // B is searched before the disk.
+    assert_eq!(read_text(&loose_path, false).unwrap(), b"mod b");
+    let log = std::fs::read_to_string(mods.join("mods.log")).unwrap();
+    assert!(
+        log.contains("B_Mod.DTA (searched before loose files)"),
+        "{log}"
+    );
+    assert!(log.contains("'Missing.dta' is in load_order.txt"), "{log}");
+    assert!(log.contains("Mod archive disabled: "), "{log}");
+    assert!(log.contains("prefer_archives = no"), "{log}");
+    // The log of the first mount is kept (appended to).
+    assert!(log.contains("Keyed.dta' could not be read"), "{log}");
+
+    // 4. prefer_archives = yes: every archive comes before the disk, and is restored after.
+    unsafe {
+        assert!(!(vt(game_archive).set_prefer_archives)(game_archive, false));
+    }
+    release(game_archive);
+    std::fs::write(mods.join("load_order.txt"), "prefer_archives = yes\n").unwrap();
+    let game_archive = mount(&dir.join("Game.dta"));
+    unsafe { (vt(game_archive).set_key)(game_archive, LOW, HIGH) };
+    assert_eq!(read_text(&loose_path, false).unwrap(), b"mod b");
+    assert_eq!(read_text("readme.txt", false).unwrap(), b"mod a");
+    release(game_archive);
+    assert_eq!(dtaModsMounted(), 0);
+    // (prefer_archives went back to no with the mods)
+    let probe = create_without_mods(&dir);
+    unsafe { assert!(!(vt(probe).set_prefer_archives)(probe, false)) };
+    release(probe);
+
+    // 5. A failed dtaCreate mounts nothing.
+    assert!(unsafe { dtaCreate(c("missing_archive.dta").as_ptr()) }.is_null());
+    assert_eq!(dtaModsMounted(), 0);
+
+    dtaSetCallbackERR(previous);
+    std::env::remove_var("RW_DATA_MODS_DIR");
+    let _ = std::fs::remove_dir_all(&loose_dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// dtaCreate with the Mods folder pointing nowhere.
+fn create_without_mods(dir: &Path) -> *mut DtaRead {
+    std::env::set_var("RW_DATA_MODS_DIR", dir.join("no_such_folder"));
+    let archive = mount(&dir.join("Game.dta"));
+    assert_eq!(dtaModsMounted(), 0);
+    archive
+}

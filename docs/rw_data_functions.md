@@ -95,6 +95,10 @@ Whether the disk or the archives are searched first is chosen per `dtaOpen` call
 (`archivesFirst`) or globally (`C_DtaArchive::SetPreferArchives`): by default a loose file on
 disk overrides the archived one.
 
+(Rust port) The archives of the `Mods` folder are mounted by the host's first `dtaCreate`,
+ahead of the host's archives, and some of them can be searched before the disk on their own;
+see the README's "Mods" section.
+
 ### 2.3 The key
 
 Every archive has a 64-bit XOR key (the game's keys are in `MountDataArchives`, see
@@ -521,7 +525,13 @@ size checks), so without one they cost nothing.
 
 When enabled, the DLL shows a message box when it is unloaded if archives were not released:
 "Not released: N reference(s) of Dta_read." and "Not released: N Dta_read(s).". It counts
-`AddRef` / `Release` calls and live archive objects.
+`AddRef` / `Release` calls and live archive objects. (The Rust port leaves out the mod
+archives, which the library owns.)
+
+#### `int dtaModsMounted(void)` (Rust port only, ordinal 27)
+
+The number of mod archives mounted from the `Mods` folder now (see the README's "Mods"
+section). The export also tells a host that the DLL mounts the mods itself.
 
 ### 5.6 File logs
 

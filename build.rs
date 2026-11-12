@@ -7,7 +7,7 @@
 // Every other target (64-bit Windows, Linux, macOS, ...) has no name decoration and uses
 // the plain names only.
 
-/// (decorated name, ordinal) of every export of the original DLL.
+/// (decorated name, ordinal) of every export of the original DLL, plus the port's own.
 const EXPORTS: &[(&str, u32)] = &[
     ("_dtaAddDir@8", 1),
     ("_dtaAddExtension@8", 2),
@@ -35,6 +35,8 @@ const EXPORTS: &[(&str, u32)] = &[
     ("_dtaSetDebugFQLExt@4", 24),
     ("_dtaSetPathBeforeLogItems@8", 25),
     ("_dtaWrite@12", 26),
+    // Port only: tells a host that this DLL mounts the Mods folder itself.
+    ("_dtaModsMounted@0", 27),
 ];
 
 fn main() {

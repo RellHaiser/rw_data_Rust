@@ -6,7 +6,8 @@ block decompression), plain file writing, file logs and FQL load recordings.
 
 The crate builds into a drop-in replacement for the DLL:
 
-* the same 26 functions with the same C interface ([include/rw_data.h](include/rw_data.h));
+* the same 26 functions with the same C interface ([include/rw_data.h](include/rw_data.h)), plus
+  `dtaModsMounted` (ordinal 27) for the [mod archives](#mods);
 * on 32-bit Windows they are `__stdcall` and exported under the original decorated names and
   ordinals (`_dtaOpen@8` @18, …; see [build.rs](build.rs));
 * the archive object keeps the MSVC 6 virtual-table layout with `__thiscall` methods, so the
@@ -38,6 +39,63 @@ The end-to-end tests in [tests/archive.rs](tests/archive.rs) pack archives with
 [tools/dta_pack.py](tools/dta_pack.py) and need Python 3.9+ on the PATH (they are skipped
 without it).
 
+## Mods
+
+The DLL mounts every `.dta` archive of the `Mods` folder next to the executable ahead of the
+game's own archives, so a file in a mod replaces the game's copy. Nothing in the executable has
+to change: the host's first `dtaCreate` mounts the mods before returning, and they are released
+again with the host's last archive (a later `dtaCreate` mounts them again, reading the folder
+afresh). Every program that uses the DLL gets the mods, the dedicated server included. The
+environment variable `RW_DATA_MODS_DIR` names another folder.
+
+Mod archives are not encrypted: pack them with a blank key.
+
+```bash
+python tools/dta_pack.py MyMod Mods/MyMod.dta --key blank
+```
+
+When two mods hold the same file, the archive mounted first wins. Archives are mounted in
+alphabetical order (ignoring case), unless `Mods/load_order.txt` says otherwise:
+
+```
+# Comments start with '#'; blank lines are skipped.
+prefer_archives = yes      # every archive is searched before loose files on disk (default: no)
+HighestPriority.dta        # mounted first: wins over everything below
+Second                     # ".dta" may be left out; names ignore case
++Textures.dta              # this archive is searched before loose files on disk
+-Disabled.dta              # not mounted
+```
+
+Archives the file does not name are mounted after the named ones, in alphabetical order.
+
+* `prefer_archives` is the global switch of `C_DtaArchive::SetPreferArchives`: with it every
+  archive (the game's own too) is searched before loose files. Without it a loose file on disk
+  overrides any archive, as in the original game. It is set back when the mods are released.
+* `+` does the same for one mod archive only: `dtaOpen` searches the `+` archives, then the
+  disk, then the other archives. (An explicit `archivesFirst` or `prefer_archives` still
+  searches every archive first.)
+
+What was mounted, and every problem (a named archive that is missing, a file that is not an
+archive, an archive packed with a key), is written to `Mods/mods.log`. The first mount of a
+process rewrites it; later ones append. Errors while mounting mods go to that log, not the
+host's error callback. Errors reading a mod archive later go to the callback, like those of
+any other archive.
+
+An archive packed with a key is detected by its ISD1 checksums failing with the blank key. ISD0
+archives have no checksums, so a keyed ISD0 mod may be mounted and read as garbage. `dta_pack.py`
+writes ISD1.
+
+Notes for hosts:
+
+* `dtaModsMounted()` returns how many mod archives are mounted now. A host that mounts mods
+  itself (for use with the original DLL) can look the export up and skip its own mounting
+  when it exists.
+* The leak report of `dtaDumpMemoryLeaks` leaves the mod archives out: they belong to the DLL.
+* A host that moves its own archive to position 0 with `SetPriority` puts it ahead of the mods.
+* The folder is found next to the executable, not next to the DLL, because the DLL's own path
+  cannot be found without the Win32 API. The game, its dedicated server and `rw_data.dll` share
+  one folder.
+
 ## Layout
 
 | file | contents (C++ port file) |
@@ -51,6 +109,7 @@ without it).
 | `src/filelog.rs`, `src/fql.rs` | file logs, FQL recording / playback |
 | `src/crypt.rs`, `src/lzss.rs`, `src/lz4.rs`, `src/wav.rs` | cipher, checksum and codecs |
 | `src/platform.rs` | the operating-system side, on `std` only |
+| `src/mods.rs` | the Mods folder (port only) |
 
 ## Differences from the C++ port
 
@@ -80,6 +139,7 @@ places:
 * On Windows, file names that are not valid UTF-8 are read as Latin-1, because the ANSI code
   page cannot be queried without the Win32 API. Plain ASCII names are unaffected.
 * The 32-bit DLL also exports `DllMain`.
+* The mod archives of the `Mods` folder ([above](#mods)) and `dtaModsMounted` are new.
 
 ## Verification
 

@@ -25,6 +25,7 @@ mod filelog;
 mod fql;
 mod lz4;
 mod lzss;
+mod mods;
 mod open;
 mod platform;
 mod read;
@@ -106,8 +107,16 @@ pub extern "system" fn dtaSetCallbackERR(callback: Option<ErrorCallback>) -> Opt
     state::with_state(|st| std::mem::replace(&mut st.error_callback, callback))
 }
 
+/// (port) The number of mod archives mounted from the Mods folder now (see mods.rs). They
+/// are mounted by the host's first dtaCreate and released with its last archive. The export
+/// also tells a host that this DLL mounts the mods itself, so the host need not.
+#[no_mangle]
+pub extern "system" fn dtaModsMounted() -> c_int {
+    state::with_state(|st| st.mods.len() as c_int)
+}
+
 /// Enables the "Not released ..." report (written to standard error) when the library
-/// unloads with archives alive.
+/// unloads with archives alive (the mod archives, which the library owns, are left out).
 #[no_mangle]
 pub extern "system" fn dtaDumpMemoryLeaks(enable: bool) {
     state::LEAK_REPORT.store(enable, std::sync::atomic::Ordering::Relaxed);

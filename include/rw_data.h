@@ -106,6 +106,11 @@ RW_DATA_API dtaErrorCallback RW_DATA_CALL dtaSetCallbackERR(dtaErrorCallback cal
 // Enables the "Not released ..." report (a message box in the original, standard error in the
 // Rust port) when the library unloads with archives alive.
 RW_DATA_API void RW_DATA_CALL dtaDumpMemoryLeaks(bool enable);
+// (Rust port only, ordinal 27) The number of mod archives mounted from the Mods folder now.
+// The host's first dtaCreate mounts them ahead of its archive; they are released with the
+// host's last archive. A host can look the export up (GetProcAddress "_dtaModsMounted@0" on
+// 32-bit Windows) to learn that the DLL mounts the mods itself. See the README.
+RW_DATA_API int RW_DATA_CALL dtaModsMounted(void);
 
 // Files ---------------------------------------------------------------------------------
 

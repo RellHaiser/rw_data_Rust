@@ -342,12 +342,24 @@ fn name_hash(file_name: &[u8]) -> (Vec<u8>, u32) {
 }
 
 pub fn open_from_archives(st: &mut State, file_name: &[u8]) -> i32 {
+    open_from_archives_where(st, file_name, |_| true)
+}
+
+/// Looks in the archives whose search slot passes `searched`, in search order.
+fn open_from_archives_where(
+    st: &mut State,
+    file_name: &[u8],
+    searched: impl Fn(&SearchSlot) -> bool,
+) -> i32 {
     let (upper_name, hash) = name_hash(file_name);
 
     let recorded = st.fql.active() && !fql::is_extension_filtered(st, &upper_name);
 
     let slot_count = st.search_order.len();
     for slot in 0..slot_count {
+        if !searched(&st.search_order[slot]) {
+            continue;
+        }
         let table = st.search_order[slot].table as usize;
         let Some(t) = st.archive_tables.get(table) else {
             continue;
@@ -393,13 +405,23 @@ pub fn open_from_disk(st: &mut State, file_name: &[u8]) -> i32 {
 }
 
 /// dtaOpen
+///
+/// (port) Without `archives_first` or prefer_archives, the archives marked `prefer` (mods
+/// marked with '+' in Mods/load_order.txt) are searched before the disk, the rest after it.
 pub fn open(file_name: &[u8], archives_first: bool) -> i32 {
     with_state(|st| {
         let handle = if !archives_first && !st.prefer_archives {
-            match open_from_disk(st, file_name) {
-                -1 => open_from_archives(st, file_name),
-                h => h,
+            let mut handle = -1;
+            if st.search_order.iter().any(|s| s.prefer) {
+                handle = open_from_archives_where(st, file_name, |s| s.prefer);
             }
+            if handle == -1 {
+                handle = open_from_disk(st, file_name);
+            }
+            if handle == -1 {
+                handle = open_from_archives_where(st, file_name, |s| !s.prefer);
+            }
+            handle
         } else {
             match open_from_archives(st, file_name) {
                 -1 => open_from_disk(st, file_name),

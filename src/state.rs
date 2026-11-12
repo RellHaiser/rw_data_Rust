@@ -110,6 +110,9 @@ pub struct SearchSlot {
     pub archive: *mut DtaRead,
     /// index in `archive_tables`
     pub table: i32,
+    /// (port) searched before the disk even when archives are not preferred (a mod archive
+    /// marked with '+' in Mods/load_order.txt; see mods.rs)
+    pub prefer: bool,
 }
 
 // OpenFile::flags
@@ -262,6 +265,16 @@ pub struct State {
     pub raw_block: Vec<u8>,
     pub next_archive_id: u32,
     pending_errors: Vec<PendingError>,
+    /// While Some, errors are collected here instead of going to the callback (mods.rs).
+    pub captured_errors: Option<Vec<c_int>>,
+    /// (port) The mod archives mounted from the Mods folder, owned by the library (mods.rs).
+    pub mods: Vec<*mut DtaRead>,
+    /// The Mods folder was looked at for the archives mounted now.
+    pub mods_mounted: bool,
+    /// Mods/mods.log was started in this process (later mounts append to it).
+    pub mods_log_started: bool,
+    /// prefer_archives before Mods/load_order.txt set it, restored when the mods go.
+    pub mods_saved_prefer: Option<bool>,
 }
 
 impl State {
@@ -279,12 +292,25 @@ impl State {
             raw_block: Vec::new(),
             next_archive_id: 1,
             pending_errors: Vec::new(),
+            captured_errors: None,
+            mods: Vec::new(),
+            mods_mounted: false,
+            mods_log_started: false,
+            mods_saved_prefer: None,
         }
+    }
+
+    /// Whether errors go anywhere (the callback, or the capture of mods.rs): the original
+    /// only computed the checksums when an error callback was installed.
+    pub fn reporting(&self) -> bool {
+        self.error_callback.is_some() || self.captured_errors.is_some()
     }
 
     /// Queues an error for the callback (if one is installed).
     pub fn report(&mut self, archive: *mut DtaRead, name: &[u8], error: c_int) {
-        if let Some(callback) = self.error_callback {
+        if let Some(captured) = &mut self.captured_errors {
+            captured.push(error);
+        } else if let Some(callback) = self.error_callback {
             self.pending_errors.push(PendingError {
                 callback,
                 archive,
@@ -392,6 +418,9 @@ pub fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
 pub static LEAK_REFERENCES: AtomicI32 = AtomicI32::new(0);
 pub static LEAK_OBJECTS: AtomicI32 = AtomicI32::new(0);
 pub static LEAK_REPORT: AtomicBool = AtomicBool::new(false);
+/// The mod archives mounted now (one object and one reference each): they belong to the
+/// library, not the host, so the report leaves them out.
+pub static MOD_ARCHIVES: AtomicI32 = AtomicI32::new(0);
 
 /// The "Not released ..." report (a message box in the original; standard error here).
 /// (macOS has no unload hook for it, see lib.rs.)
@@ -401,11 +430,12 @@ pub fn report_leaks() {
         return;
     }
     let mut message = String::new();
-    let references = LEAK_REFERENCES.load(Ordering::Relaxed);
+    let mods = MOD_ARCHIVES.load(Ordering::Relaxed);
+    let references = LEAK_REFERENCES.load(Ordering::Relaxed) - mods;
     if references != 0 {
         message += &format!("Not released:  {references}  reference(s) of Dta_read.\n");
     }
-    let objects = LEAK_OBJECTS.load(Ordering::Relaxed);
+    let objects = LEAK_OBJECTS.load(Ordering::Relaxed) - mods;
     if objects != 0 {
         message += &format!("Not released:  {objects}  Dta_read(s).\n");
     }
